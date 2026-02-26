@@ -8,27 +8,38 @@ void CFreezeBars::RenderFreezeBar(const int ClientId)
 	const float FreezeBarHalfWidth = 32.0f;
 	const float FreezeBarHeight = 16.0f;
 
-	// pCharacter contains the predicted character for local players or the last snap for players who are spectated
-	CCharacterCore *pCharacter = &GameClient()->m_aClients[ClientId].m_Predicted;
+	const auto &CharSnap = GameClient()->m_Snap.m_aCharacters[ClientId];
+	if(!CharSnap.m_Active)
+		return;
 
-	if(pCharacter->m_FreezeEnd <= 0 || pCharacter->m_FreezeStart == 0 || pCharacter->m_FreezeEnd <= pCharacter->m_FreezeStart || !GameClient()->m_Snap.m_aCharacters[ClientId].m_HasExtendedDisplayInfo || (pCharacter->m_IsInFreeze && g_Config.m_ClFreezeBarsAlphaInsideFreeze == 0))
+	const bool IsLocal = (ClientId == GameClient()->m_aLocalIds[0] || ClientId == GameClient()->m_aLocalIds[1]);
+	const bool IsSpec = (GameClient()->m_Snap.m_SpecInfo.m_Active && ClientId == GameClient()->m_Snap.m_SpecInfo.m_SpectatorId);
+
+	int FreezeStart = 0;
+	int FreezeEnd = 0;
+	if(CharSnap.m_HasExtendedData)
+	{
+		FreezeStart = CharSnap.m_ExtendedData.m_FreezeStart;
+		FreezeEnd = CharSnap.m_ExtendedData.m_FreezeEnd;
+	}
+
+	const bool IsInFreeze = (IsLocal || IsSpec) ? GameClient()->m_aClients[ClientId].m_Predicted.m_IsInFreeze : (FreezeStart != 0 && Client()->GameTick(g_Config.m_ClDummy) < FreezeEnd);
+	if(FreezeEnd <= 0 || FreezeStart == 0 || FreezeEnd <= FreezeStart || !CharSnap.m_HasExtendedDisplayInfo || (IsInFreeze && g_Config.m_ClFreezeBarsAlphaInsideFreeze == 0))
 	{
 		return;
 	}
 
-	const int Max = pCharacter->m_FreezeEnd - pCharacter->m_FreezeStart;
-	float FreezeProgress = std::clamp(Max - (Client()->GameTick(g_Config.m_ClDummy) - pCharacter->m_FreezeStart), 0, Max) / (float)Max;
+	const int Max = FreezeEnd - FreezeStart;
+	float FreezeProgress = std::clamp(Max - (Client()->GameTick(g_Config.m_ClDummy) - FreezeStart), 0, Max) / (float)Max;
 	if(FreezeProgress <= 0.0f)
-	{
 		return;
-	}
 
 	vec2 Position = GameClient()->m_aClients[ClientId].m_RenderPos;
 	Position.x -= FreezeBarHalfWidth;
 	Position.y += 32;
 
 	float Alpha = GameClient()->IsOtherTeam(ClientId) ? g_Config.m_ClShowOthersAlpha / 100.0f : 1.0f;
-	if(pCharacter->m_IsInFreeze)
+	if(IsInFreeze)
 	{
 		Alpha *= g_Config.m_ClFreezeBarsAlphaInsideFreeze / 100.0f;
 	}
