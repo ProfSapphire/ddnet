@@ -150,13 +150,47 @@ class CChat : public CComponent
 	bool m_ServerSupportsCommandInfo;
 
 	// ----- Ollama AI auto-reply -----
-	static constexpr const char *OLLAMA_MODEL = "gemma4:e2b";
 	static constexpr const char *OLLAMA_URL = "http://localhost:11434/api/chat";
+	static constexpr int OLLAMA_MAX_HISTORY_TEXT = 512;
+	static constexpr int OLLAMA_PENDING_QUEUE_SIZE = 3;
+	static constexpr int OLLAMA_PENDING_ECHO_LIMIT = 8;
+
+	struct SOllamaHistoryEntry
+	{
+		bool m_Assistant = false;
+		char m_aText[OLLAMA_MAX_HISTORY_TEXT] = {0};
+	};
+
+	struct SOllamaPendingRequest
+	{
+		char m_aSender[64] = {0};
+		char m_aMessage[MAX_LINE_LENGTH] = {0};
+		std::vector<SOllamaHistoryEntry> m_vContext;
+	};
+
+	struct SOllamaPendingEcho
+	{
+		char m_aText[MAX_LINE_LENGTH] = {0};
+	};
 
 	std::shared_ptr<CHttpRequest> m_pOllamaRequest;
 	bool m_OllamaRequestPending = false;
 	char m_aOllamaPendingSender[64] = {0};
+	SOllamaPendingRequest m_ActiveOllamaRequest;
+	std::vector<SOllamaHistoryEntry> m_vOllamaHistory;
+	std::vector<SOllamaPendingRequest> m_vOllamaPendingRequests;
+	std::vector<SOllamaPendingEcho> m_vOllamaPendingEchoes;
 
+	void CancelOllamaWork();
+	void ResetOllamaState();
+	void AddOllamaHistoryEntry(bool Assistant, const char *pText);
+	void AddPublicChatToOllamaHistory(const char *pSenderName, const char *pMessage);
+	void EnqueueOllamaRequest(const char *pSenderName, const char *pMessage);
+	void StartNextOllamaRequest();
+	bool ConsumePendingOllamaEcho(const char *pText);
+	bool IsPublicPlayerChat(int ClientId, int Team) const;
+	bool IsLocalClient(int ClientId) const;
+	const char *StripLocalNamePrefix(const char *pMessage) const;
 	void AskOllama(const char *pSenderName, const char *pMessage);
 	void OnOllamaResponse();
 	// --------------------------------

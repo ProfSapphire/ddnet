@@ -729,6 +729,11 @@ MACRO_CONFIG_INT(ClChatOld, cl_chat_old, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE,
 MACRO_CONFIG_INT(ClChatFontSize, cl_chat_size, 60, 10, 100, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Chat font size")
 MACRO_CONFIG_INT(ClChatWidth, cl_chat_width, 200, 140, 400, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Chat width")
 MACRO_CONFIG_COL(ClChatBackgroundColor, cl_chat_background_color, 201326592, CFGFLAG_CLIENT | CFGFLAG_SAVE | CFGFLAG_COLALPHA, "Chat background color")
+MACRO_CONFIG_INT(ClOllamaEnable, cl_ollama_enable, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable Ollama auto-replies for highlighted public chat messages")
+MACRO_CONFIG_STR(ClOllamaSystemPrompt, cl_ollama_system_prompt, 512, "You are a very wholesome Player who is very polite and honest (no racial slurs ever!). Keep it under 3 sentences.", CFGFLAG_CLIENT | CFGFLAG_SAVE, "System prompt used for Ollama chat replies")
+MACRO_CONFIG_STR(ClOllamaModel, cl_ollama_model, 128, "gemma4:e2b", CFGFLAG_CLIENT | CFGFLAG_SAVE, "Ollama model used for chat replies")
+MACRO_CONFIG_INT(ClOllamaContext, cl_ollama_context, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Include recent public chat context in Ollama requests")
+MACRO_CONFIG_INT(ClOllamaContextMessages, cl_ollama_context_messages, 10, 0, 32, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Number of recent public chat messages to include in Ollama requests")
 
 MACRO_CONFIG_INT(ClShowDirection, cl_show_direction, 1, 0, 3, CFGFLAG_SAVE | CFGFLAG_CLIENT, "Show key presses (1 = other players', 2 = everyone, 3 = only your own")
 MACRO_CONFIG_INT(ClDirectionSize, cl_direction_size, 30, -50, 100, CFGFLAG_SAVE | CFGFLAG_CLIENT, "Size of key press icons")
