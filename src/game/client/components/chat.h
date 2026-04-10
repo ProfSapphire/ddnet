@@ -16,6 +16,9 @@
 #include <game/client/lineinput.h>
 #include <game/client/render.h>
 
+#include <memory>
+#include <engine/shared/http.h>
+
 #include <vector>
 
 constexpr auto SAVES_FILE = "ddnet-saves.txt";
@@ -145,6 +148,18 @@ class CChat : public CComponent
 	bool m_EditingNewLine;
 
 	bool m_ServerSupportsCommandInfo;
+
+	// ----- Ollama AI auto-reply -----
+	static constexpr const char *OLLAMA_MODEL = "gemma4:e2b";
+	static constexpr const char *OLLAMA_URL = "http://localhost:11434/api/chat";
+
+	std::shared_ptr<CHttpRequest> m_pOllamaRequest;
+	bool m_OllamaRequestPending = false;
+	char m_aOllamaPendingSender[64] = {0};
+
+	void AskOllama(const char *pSenderName, const char *pMessage);
+	void OnOllamaResponse();
+	// --------------------------------
 
 	static void ConSay(IConsole::IResult *pResult, void *pUserData);
 	static void ConSayTeam(IConsole::IResult *pResult, void *pUserData);

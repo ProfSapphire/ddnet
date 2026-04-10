@@ -11,6 +11,8 @@
 #include <engine/keys.h>
 #include <engine/shared/config.h>
 #include <engine/shared/csv.h>
+#include <engine/shared/http.h>
+#include <engine/shared/json.h>
 #include <engine/textrender.h>
 
 #include <generated/protocol.h>
@@ -48,6 +50,8 @@ void CChat::CLine::Reset(CChat &This)
 CChat::CChat()
 {
 	m_Mode = MODE_NONE;
+	m_OllamaRequestPending = false;
+	m_aOllamaPendingSender[0] = '\0';
 
 	m_Input.SetCalculateOffsetCallback([this]() { return m_IsInputCensored; });
 	m_Input.SetDisplayTextCallback([this](char *pStr, size_t NumChars) {
@@ -147,6 +151,12 @@ void CChat::Reset()
 	DisableMode();
 	m_vServerCommands.clear();
 
+	if(m_pOllamaRequest)
+		m_pOllamaRequest->Abort();
+	m_pOllamaRequest.reset();
+	m_OllamaRequestPending = false;
+	m_aOllamaPendingSender[0] = '\0';
+
 	for(int64_t &LastSoundPlayed : m_aLastSoundPlayed)
 		LastSoundPlayed = 0;
 }
@@ -244,6 +254,10 @@ void CChat::OnInit()
 	Console()->Chain("cl_chat_old", ConchainChatOld, this);
 	Console()->Chain("cl_chat_size", ConchainChatFontSize, this);
 	Console()->Chain("cl_chat_width", ConchainChatWidth, this);
+
+	// Ollama runs on localhost over plain HTTP; DDNet's curl blocks HTTP by
+	// default so we enable the insecure-protocol flag here.
+	g_Config.m_HttpAllowInsecure = 1;
 }
 
 bool CChat::OnInput(const IInput::CEvent &Event)
@@ -894,6 +908,39 @@ void CChat::AddLine(int ClientId, int Team, const char *pLine)
 			{
 				GameClient()->Editor()->UpdateMentions();
 			}
+
+			// [ollama-debug] name was mentioned → try to fire AskOllama
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama",
+				m_OllamaRequestPending ? "highlight detected but request already pending — skipping" :
+				(ClientId < 0 ? "highlight detected but ClientId < 0 — skipping" : "highlight detected, firing AskOllama"));
+
+			if(!m_OllamaRequestPending && ClientId >= 0)
+			{
+				// Strip any leading "YourName: " or "YourName, " prefix from the
+				// message so your own name doesn't end up in the Ollama prompt.
+				const char *pPrompt = pLine;
+				for(int LocalId : GameClient()->m_aLocalIds)
+				{
+					if(LocalId < 0)
+						continue;
+					const char *pLocalName = GameClient()->m_aClients[LocalId].m_aName;
+					int NameLen = str_length(pLocalName);
+					if(str_startswith(pPrompt, pLocalName) && NameLen < str_length(pPrompt))
+					{
+						const char *pAfter = pPrompt + NameLen;
+						while(*pAfter == ':' || *pAfter == ',' || *pAfter == ' ')
+							++pAfter;
+						if(*pAfter)
+							pPrompt = pAfter;
+					}
+				}
+				AskOllama(CurrentLine.m_aName, pPrompt);
+			}
+		}
+		else
+		{
+			// [ollama-debug] inside the 300ms sound cooldown gate
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "highlight detected but inside sound cooldown — AskOllama NOT called");
 		}
 	}
 	else if(Team != TEAM_WHISPER_SEND)
@@ -915,6 +962,164 @@ void CChat::AddLine(int ClientId, int Team, const char *pLine)
 		}
 	}
 }
+
+// ----- Ollama AI auto-reply -----
+void CChat::AskOllama(const char *pSenderName, const char *pMessage)
+{
+	if(m_OllamaRequestPending || !pSenderName || !pSenderName[0] || !pMessage || !pMessage[0])
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "AskOllama: early-exit (pending or empty args)");
+		return;
+	}
+
+	str_copy(m_aOllamaPendingSender, pSenderName, sizeof(m_aOllamaPendingSender));
+
+	// Escape the message text for embedding inside a JSON string literal.
+	char aEscaped[1024];
+	char *pDst = aEscaped;
+	str_escape(&pDst, pMessage, aEscaped + sizeof(aEscaped));
+
+	char aBody[4096];
+	str_format(aBody, sizeof(aBody),
+		"{"
+		"\"model\":\"%s\","
+		"\"messages\":["
+			"{"
+				"\"role\":\"system\","
+				"\"content\":\"You are a very wholesome Player who is very polite and honest (no racial slurs ever!). Keep it under 3 sentences.\""
+			"},"
+			"{"
+				"\"role\":\"user\","
+				"\"content\":\"%s: %s\""
+			"}"
+		"],"
+		"\"stream\":false"
+		"}",
+		OLLAMA_MODEL, pSenderName, aEscaped);
+
+	{
+		char aDbg[256];
+		str_format(aDbg, sizeof(aDbg), "AskOllama: sending to %s  body=%s", OLLAMA_URL, aBody);
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", aDbg);
+	}
+
+	auto pRequest = std::make_shared<CHttpRequest>(OLLAMA_URL);
+	pRequest->Timeout(CTimeout{.m_ConnectTimeoutMs = 4000, .m_TimeoutMs = 30000, .m_LowSpeedLimit = 0, .m_LowSpeedTime = 0});
+	pRequest->PostJson(aBody);
+
+	Http()->Run(pRequest);
+
+	m_pOllamaRequest = std::move(pRequest);
+	m_OllamaRequestPending = true;
+	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "AskOllama: request queued, waiting for response...");
+}
+
+void CChat::OnOllamaResponse()
+{
+	m_OllamaRequestPending = false;
+	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: called");
+
+	if(!m_pOllamaRequest)
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: request pointer is null — abort");
+		return;
+	}
+
+	const EHttpState State = m_pOllamaRequest->State();
+	if(State == EHttpState::ERROR || State == EHttpState::ABORTED)
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: HTTP error or aborted");
+		m_pOllamaRequest.reset();
+		return;
+	}
+
+	{
+		char aDbg[64];
+		str_format(aDbg, sizeof(aDbg), "OnOllamaResponse: HTTP status %d", m_pOllamaRequest->StatusCode());
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", aDbg);
+	}
+
+	if(m_pOllamaRequest->StatusCode() != 200)
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "OnOllamaResponse: unexpected status %d", m_pOllamaRequest->StatusCode());
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", aBuf);
+		m_pOllamaRequest.reset();
+		return;
+	}
+
+	unsigned char *pData = nullptr;
+	size_t DataSize = 0;
+	m_pOllamaRequest->Result(&pData, &DataSize);
+
+	{
+		char aDbg[64];
+		str_format(aDbg, sizeof(aDbg), "OnOllamaResponse: body size=%zu", DataSize);
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", aDbg);
+	}
+
+	if(!pData || DataSize == 0)
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: empty body");
+		m_pOllamaRequest.reset();
+		return;
+	}
+
+	json_value *pJson = json_parse((const char *)pData, DataSize);
+	if(!pJson)
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: JSON parse failed");
+		m_pOllamaRequest.reset();
+		return;
+	}
+
+	const char *pResponseText = nullptr;
+
+	if(pJson->type == json_object)
+	{
+		for(unsigned int i = 0; i < pJson->u.object.length; ++i)
+		{
+			// find "message"
+			if(str_comp(pJson->u.object.values[i].name, "message") == 0)
+			{
+				json_value *pMessage = pJson->u.object.values[i].value;
+
+				if(pMessage && pMessage->type == json_object)
+				{
+					for(unsigned int j = 0; j < pMessage->u.object.length; ++j)
+					{
+						// find "content"
+						if(str_comp(pMessage->u.object.values[j].name, "content") == 0 &&
+							pMessage->u.object.values[j].value &&
+							pMessage->u.object.values[j].value->type == json_string)
+						{
+							pResponseText = pMessage->u.object.values[j].value->u.string.ptr;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if(pResponseText && pResponseText[0])
+	{
+		char aBuf[MAX_LINE_LENGTH];
+		str_format(aBuf, sizeof(aBuf), "%s: %s", m_aOllamaPendingSender, pResponseText);
+
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: sending reply to chat");
+		SendChat(0, aBuf);
+	}
+	else
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: no 'content' found in JSON");
+	}
+
+	json_value_free(pJson);
+	m_pOllamaRequest.reset();
+}
+
+// --------------------------------
 
 void CChat::OnPrepareLines(float y)
 {
@@ -1152,6 +1357,13 @@ void CChat::OnRender()
 	if(Client()->State() != IClient::STATE_ONLINE && Client()->State() != IClient::STATE_DEMOPLAYBACK)
 		return;
 
+	if(m_pOllamaRequest && m_OllamaRequestPending)
+	{
+		if(m_pOllamaRequest->Done())
+		{
+			OnOllamaResponse();
+		}
+	}
 	// send pending chat messages
 	if(m_PendingChatCounter > 0 && m_LastChatSend + time_freq() < time())
 	{
