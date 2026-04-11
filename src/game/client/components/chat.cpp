@@ -26,18 +26,43 @@
 #include <game/client/gameclient.h>
 #include <game/localization.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
 #include <string>
 
 char CChat::ms_aDisplayText[MAX_LINE_LENGTH] = "";
 
 namespace
 {
+constexpr int OLLAMA_IDLE_ACTIVITY_WINDOW_SECONDS = 45;
+constexpr int OLLAMA_IDLE_RECENT_MESSAGE_SECONDS = 15;
+
 void AppendJsonEscaped(std::string &Json, const char *pText)
 {
-	char aEscaped[2048];
+	char aEscaped[8192];
 	char *pDst = aEscaped;
 	str_escape(&pDst, pText, aEscaped + sizeof(aEscaped));
 	Json.append(aEscaped);
+}
+
+void AppendJsonField(std::string &Json, const char *pName, const char *pValue)
+{
+	Json.push_back('"');
+	Json.append(pName);
+	Json.append("\":\"");
+	AppendJsonEscaped(Json, pValue ? pValue : "");
+	Json.push_back('"');
+}
+
+void AppendJsonIntField(std::string &Json, const char *pName, int64_t Value)
+{
+	char aBuf[64];
+	str_format(aBuf, sizeof(aBuf), "%lld", (long long)Value);
+	Json.push_back('"');
+	Json.append(pName);
+	Json.append("\":");
+	Json.append(aBuf);
 }
 
 void AppendJsonMessage(std::string &Json, const char *pRole, const char *pContent)
@@ -81,6 +106,205 @@ const char *FindMessageContent(json_value *pJson)
 	}
 
 	return nullptr;
+}
+
+const char *SkipReplyPrefix(const char *pText, const char *pPrefix)
+{
+	if(!pText || !pPrefix || !pPrefix[0])
+	{
+		return pText;
+	}
+
+	const char *pAfterPrefix = str_startswith_nocase(pText, pPrefix);
+	if(!pAfterPrefix)
+	{
+		return pText;
+	}
+
+	const char *pAfter = pAfterPrefix;
+	while(*pAfter == ':' || *pAfter == ',' || *pAfter == '-' || *pAfter == '>' || *pAfter == '"' || *pAfter == '\'' || *pAfter == ' ')
+	{
+		++pAfter;
+	}
+	return pAfter;
+}
+
+bool ContainsWholeWord(const char *pText, const char *pWord)
+{
+	if(!pText || !pWord || !pWord[0])
+	{
+		return false;
+	}
+
+	const int WordLength = str_length(pWord);
+	for(const char *pHit = str_find_nocase(pText, pWord); pHit; pHit = str_find_nocase(pHit + 1, pWord))
+	{
+		const auto IsAsciiWordChar = [](char Character) {
+			return (Character >= '0' && Character <= '9') || (Character >= 'A' && Character <= 'Z') || (Character >= 'a' && Character <= 'z') || Character == '_';
+		};
+		const bool LeftBoundary = pHit == pText || !IsAsciiWordChar(pHit[-1]);
+		const bool RightBoundary = pHit[WordLength] == '\0' || !IsAsciiWordChar(pHit[WordLength]);
+		if(LeftBoundary && RightBoundary)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ContainsAnyWholeWord(const char *pText, const char *const *ppWords, size_t NumWords)
+{
+	for(size_t i = 0; i < NumWords; ++i)
+	{
+		if(ContainsWholeWord(pText, ppWords[i]))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+int ScoreKeywordHits(const char *pText, const char *const *ppWords, size_t NumWords)
+{
+	int Score = 0;
+	for(size_t i = 0; i < NumWords; ++i)
+	{
+		if(ContainsWholeWord(pText, ppWords[i]))
+		{
+			++Score;
+		}
+	}
+	return Score;
+}
+
+void NormalizeChatTextSingleLine(char *pBuffer, size_t BufferSize, const char *pText)
+{
+	if(BufferSize == 0)
+	{
+		return;
+	}
+
+	pBuffer[0] = '\0';
+	if(!pText)
+	{
+		return;
+	}
+
+	std::string Out;
+	Out.reserve(str_length(pText));
+	bool LastWasSpace = true;
+	for(const char *pCursor = pText; *pCursor; ++pCursor)
+	{
+		char Character = *pCursor;
+		const bool IsSpace = Character == '\r' || Character == '\n' || Character == '\t' || Character == ' ';
+		if(IsSpace)
+		{
+			if(!LastWasSpace)
+			{
+				Out.push_back(' ');
+				LastWasSpace = true;
+			}
+		}
+		else
+		{
+			Out.push_back(Character);
+			LastWasSpace = false;
+		}
+	}
+
+	while(!Out.empty() && Out.back() == ' ')
+	{
+		Out.pop_back();
+	}
+
+	str_copy(pBuffer, Out.c_str(), BufferSize);
+}
+
+void CopyUtf8Excerpt(char *pBuffer, size_t BufferSize, const char *pText, int MaxChars)
+{
+	if(BufferSize == 0)
+	{
+		return;
+	}
+
+	pBuffer[0] = '\0';
+	if(!pText || !pText[0])
+	{
+		return;
+	}
+
+	char aSingleLine[512];
+	NormalizeChatTextSingleLine(aSingleLine, sizeof(aSingleLine), pText);
+	str_utf8_truncate(pBuffer, (int)BufferSize, aSingleLine, MaxChars);
+}
+
+const char *FindPreferenceCue(const char *pMessage)
+{
+	static const char *const s_apPreferenceCues[] = {
+		"i like",
+		"i love",
+		"i hate",
+		"i prefer",
+		"favorite",
+		"favourite",
+	};
+
+	const char *pBest = nullptr;
+	for(const char *pCue : s_apPreferenceCues)
+	{
+		const char *pHit = str_find_nocase(pMessage, pCue);
+		if(pHit && (!pBest || pHit < pBest))
+		{
+			pBest = pHit;
+		}
+	}
+	return pBest;
+}
+
+void ExtractPreferenceExcerpt(char *pBuffer, size_t BufferSize, const char *pMessage)
+{
+	if(BufferSize == 0)
+	{
+		return;
+	}
+
+	pBuffer[0] = '\0';
+	if(!pMessage || !pMessage[0])
+	{
+		return;
+	}
+
+	const char *pStart = FindPreferenceCue(pMessage);
+	if(!pStart)
+	{
+		return;
+	}
+
+	const char *pEnd = pStart;
+	while(*pEnd && *pEnd != '.' && *pEnd != '!' && *pEnd != '?' && *pEnd != ';')
+	{
+		++pEnd;
+	}
+
+	char aPreference[256];
+	str_truncate(aPreference, sizeof(aPreference), pStart, (int)(pEnd - pStart));
+	CopyUtf8Excerpt(pBuffer, BufferSize, aPreference, 48);
+}
+
+bool AdjustTowardZero(int &Value)
+{
+	if(Value > 0)
+	{
+		--Value;
+		return true;
+	}
+	if(Value < 0)
+	{
+		++Value;
+		return true;
+	}
+	return false;
 }
 }
 
@@ -720,7 +944,6 @@ void CChat::CancelOllamaWork()
 	}
 
 	m_OllamaRequestPending = false;
-	m_aOllamaPendingSender[0] = '\0';
 	m_ActiveOllamaRequest = SOllamaPendingRequest{};
 	m_vOllamaPendingRequests.clear();
 }
@@ -730,6 +953,42 @@ void CChat::ResetOllamaState()
 	CancelOllamaWork();
 	m_vOllamaHistory.clear();
 	m_vOllamaPendingEchoes.clear();
+	m_vOllamaPlayerMemories.clear();
+	m_vRecentPublicChats.clear();
+	m_NextOllamaRequestId = 1;
+	m_OllamaMoodScore = 0;
+	m_LastOllamaReplyTime = 0;
+	m_LastOllamaIdleChatTime = 0;
+}
+
+void CChat::GetOllamaPersonaName(char *pBuffer, size_t BufferSize) const
+{
+	if(BufferSize == 0)
+	{
+		return;
+	}
+
+	if(g_Config.m_ClOllamaPersonaName[0])
+	{
+		str_copy(pBuffer, g_Config.m_ClOllamaPersonaName, BufferSize);
+	}
+	else
+	{
+		str_copy(pBuffer, "Teebot", BufferSize);
+	}
+}
+
+const char *CChat::GetOllamaMoodLabel(int MoodScore) const
+{
+	if(MoodScore >= 2)
+	{
+		return "happy";
+	}
+	if(MoodScore <= -2)
+	{
+		return "annoyed";
+	}
+	return "bored";
 }
 
 void CChat::AddOllamaHistoryEntry(bool Assistant, const char *pText)
@@ -763,16 +1022,375 @@ void CChat::AddPublicChatToOllamaHistory(const char *pSenderName, const char *pM
 	AddOllamaHistoryEntry(false, aHistoryLine);
 }
 
-void CChat::EnqueueOllamaRequest(const char *pSenderName, const char *pMessage)
+void CChat::UpdateOllamaMood(const char *pMessage)
 {
-	if(!g_Config.m_ClOllamaEnable || !pSenderName || !pSenderName[0] || !pMessage || !pMessage[0])
+	if(!g_Config.m_ClOllamaMood || !pMessage || !pMessage[0])
+	{
+		return;
+	}
+
+	char aLower[512];
+	str_utf8_tolower(pMessage, aLower, sizeof(aLower));
+
+	static const char *const s_apPositiveWords[] = {
+		"thanks",
+		"thank you",
+		"thx",
+		"ty",
+		"good bot",
+		"nice",
+		"great",
+		"awesome",
+		"love",
+	};
+	static const char *const s_apNegativeWords[] = {
+		"bad bot",
+		"stupid",
+		"idiot",
+		"dumb",
+		"useless",
+		"annoying",
+		"cringe",
+		"shut up",
+		"hate",
+	};
+
+	const bool Positive = ContainsAnyWholeWord(aLower, s_apPositiveWords, std::size(s_apPositiveWords));
+	const bool Negative = ContainsAnyWholeWord(aLower, s_apNegativeWords, std::size(s_apNegativeWords));
+
+	if(Positive && !Negative)
+	{
+		m_OllamaMoodScore = minimum(m_OllamaMoodScore + 2, 4);
+	}
+	else if(Negative && !Positive)
+	{
+		m_OllamaMoodScore = maximum(m_OllamaMoodScore - 2, -4);
+	}
+	else
+	{
+		AdjustTowardZero(m_OllamaMoodScore);
+	}
+}
+
+void CChat::UpdateOllamaPlayerMemory(const char *pSpeakerName, const char *pMessage, int64_t Now)
+{
+	if(!g_Config.m_ClOllamaPlayerMemory || !pSpeakerName || !pSpeakerName[0] || !pMessage || !pMessage[0])
+	{
+		return;
+	}
+
+	const char *pTopicText = StripLocalNamePrefix(pMessage);
+	if(!pTopicText || !pTopicText[0])
+	{
+		pTopicText = pMessage;
+	}
+
+	auto It = std::find_if(m_vOllamaPlayerMemories.begin(), m_vOllamaPlayerMemories.end(), [pSpeakerName](const SOllamaPlayerMemory &Memory) {
+		return str_comp(Memory.m_aPlayerName, pSpeakerName) == 0;
+	});
+
+	SOllamaPlayerMemory Memory;
+	if(It != m_vOllamaPlayerMemories.end())
+	{
+		Memory = *It;
+		m_vOllamaPlayerMemories.erase(It);
+	}
+	else
+	{
+		str_copy(Memory.m_aPlayerName, pSpeakerName, sizeof(Memory.m_aPlayerName));
+	}
+
+	CopyUtf8Excerpt(Memory.m_aLastTopicExcerpt, sizeof(Memory.m_aLastTopicExcerpt), pTopicText, 64);
+	ExtractPreferenceExcerpt(Memory.m_aLastPreferenceExcerpt, sizeof(Memory.m_aLastPreferenceExcerpt), pTopicText);
+	Memory.m_LastSeenTime = Now;
+
+	m_vOllamaPlayerMemories.push_back(Memory);
+	if((int)m_vOllamaPlayerMemories.size() > OLLAMA_PLAYER_MEMORY_LIMIT)
+	{
+		m_vOllamaPlayerMemories.erase(m_vOllamaPlayerMemories.begin());
+	}
+}
+
+bool CChat::GetOllamaPlayerMemorySnapshot(const char *pSpeakerName, SOllamaPlayerMemory &Memory) const
+{
+	if(!g_Config.m_ClOllamaPlayerMemory || !pSpeakerName || !pSpeakerName[0])
+	{
+		return false;
+	}
+
+	for(auto It = m_vOllamaPlayerMemories.rbegin(); It != m_vOllamaPlayerMemories.rend(); ++It)
+	{
+		if(str_comp(It->m_aPlayerName, pSpeakerName) == 0)
+		{
+			Memory = *It;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void CChat::AddRecentPublicChatEvent(const char *pSpeakerName, const char *pMessage, int64_t Now)
+{
+	if(!pSpeakerName || !pSpeakerName[0] || !pMessage || !pMessage[0])
+	{
+		return;
+	}
+
+	SOllamaRecentPublicChat Event;
+	str_copy(Event.m_aSender, pSpeakerName, sizeof(Event.m_aSender));
+	str_copy(Event.m_aText, pMessage, sizeof(Event.m_aText));
+	Event.m_Time = Now;
+	m_vRecentPublicChats.push_back(Event);
+
+	if((int)m_vRecentPublicChats.size() > OLLAMA_RECENT_PUBLIC_CHAT_LIMIT)
+	{
+		m_vRecentPublicChats.erase(m_vRecentPublicChats.begin(), m_vRecentPublicChats.begin() + (m_vRecentPublicChats.size() - OLLAMA_RECENT_PUBLIC_CHAT_LIMIT));
+	}
+}
+
+void CChat::PruneRecentPublicChatEvents(int64_t Now)
+{
+	const int64_t Cutoff = Now - (int64_t)OLLAMA_IDLE_ACTIVITY_WINDOW_SECONDS * time_freq();
+	while(!m_vRecentPublicChats.empty() && m_vRecentPublicChats.front().m_Time < Cutoff)
+	{
+		m_vRecentPublicChats.erase(m_vRecentPublicChats.begin());
+	}
+}
+
+void CChat::DetectOllamaLanguageHint(const char *pMessage, char *pLanguageHint, size_t LanguageHintSize, char *pDetectedLanguage, size_t DetectedLanguageSize) const
+{
+	if(LanguageHintSize > 0)
+	{
+		pLanguageHint[0] = '\0';
+	}
+	if(DetectedLanguageSize > 0)
+	{
+		pDetectedLanguage[0] = '\0';
+	}
+
+	if(!pMessage || !pMessage[0])
+	{
+		return;
+	}
+
+	int Latin = 0;
+	int Cyrillic = 0;
+	int Greek = 0;
+	int Arabic = 0;
+	int Hebrew = 0;
+	int Hangul = 0;
+	int Cjk = 0;
+
+	for(const char *pCursor = pMessage; *pCursor;)
+	{
+		const int Code = str_utf8_decode(&pCursor);
+		if(Code <= 0 || str_utf8_isspace(Code))
+		{
+			continue;
+		}
+
+		if((Code >= 0x0041 && Code <= 0x024F) || (Code >= 0x1E00 && Code <= 0x1EFF))
+			++Latin;
+		else if(Code >= 0x0400 && Code <= 0x052F)
+			++Cyrillic;
+		else if(Code >= 0x0370 && Code <= 0x03FF)
+			++Greek;
+		else if(Code >= 0x0590 && Code <= 0x05FF)
+			++Hebrew;
+		else if(Code >= 0x0600 && Code <= 0x06FF)
+			++Arabic;
+		else if((Code >= 0x3040 && Code <= 0x30FF) || (Code >= 0x4E00 && Code <= 0x9FFF))
+			++Cjk;
+		else if(Code >= 0xAC00 && Code <= 0xD7AF)
+			++Hangul;
+	}
+
+	if(Cyrillic > Latin && Cyrillic > 0)
+	{
+		str_copy(pDetectedLanguage, "cyrillic", DetectedLanguageSize);
+		str_copy(pLanguageHint, "Reply in the same Cyrillic-script language as the latest message.", LanguageHintSize);
+		return;
+	}
+	if(Arabic > 0 && Arabic >= Latin)
+	{
+		str_copy(pDetectedLanguage, "arabic-script", DetectedLanguageSize);
+		str_copy(pLanguageHint, "Reply in the same Arabic-script language as the latest message.", LanguageHintSize);
+		return;
+	}
+	if(Hebrew > 0 && Hebrew >= Latin)
+	{
+		str_copy(pDetectedLanguage, "hebrew-script", DetectedLanguageSize);
+		str_copy(pLanguageHint, "Reply in the same Hebrew-script language as the latest message.", LanguageHintSize);
+		return;
+	}
+	if(Greek > 0 && Greek >= Latin)
+	{
+		str_copy(pDetectedLanguage, "greek-script", DetectedLanguageSize);
+		str_copy(pLanguageHint, "Reply in the same Greek-script language as the latest message.", LanguageHintSize);
+		return;
+	}
+	if(Hangul > 0 && Hangul >= Latin)
+	{
+		str_copy(pDetectedLanguage, "hangul", DetectedLanguageSize);
+		str_copy(pLanguageHint, "Reply in the same Korean language and script as the latest message.", LanguageHintSize);
+		return;
+	}
+	if(Cjk > 0 && Cjk >= Latin)
+	{
+		str_copy(pDetectedLanguage, "cjk", DetectedLanguageSize);
+		str_copy(pLanguageHint, "Reply in the same East Asian language and script as the latest message.", LanguageHintSize);
+		return;
+	}
+
+	char aLower[512];
+	str_utf8_tolower(pMessage, aLower, sizeof(aLower));
+
+	struct SLanguageScore
+	{
+		const char *m_pCode;
+		const char *m_pHint;
+		int m_Score;
+	};
+
+	static const char *const s_apEnglishWords[] = {"hello", "thanks", "please", "you", "what", "why"};
+	static const char *const s_apGermanWords[] = {"hallo", "danke", "bitte", "nicht", "ich", "und"};
+	static const char *const s_apSpanishWords[] = {"hola", "gracias", "por", "que", "eres", "para"};
+	static const char *const s_apFrenchWords[] = {"bonjour", "merci", "avec", "pour", "est", "vous"};
+	static const char *const s_apPortugueseWords[] = {"ola", "olá", "obrigado", "obrigada", "voce", "voces", "você"};
+	static const char *const s_apPolishWords[] = {"czesc", "cześć", "dzieki", "dzięki", "lubie", "lubię", "nie"};
+	static const char *const s_apTurkishWords[] = {"merhaba", "tesekkur", "teşekkür", "degil", "degil", "bir", "sen"};
+
+	SLanguageScore aScores[] = {
+		{"en", "Reply in English.", ScoreKeywordHits(aLower, s_apEnglishWords, std::size(s_apEnglishWords))},
+		{"de", "Reply in German.", ScoreKeywordHits(aLower, s_apGermanWords, std::size(s_apGermanWords))},
+		{"es", "Reply in Spanish.", ScoreKeywordHits(aLower, s_apSpanishWords, std::size(s_apSpanishWords))},
+		{"fr", "Reply in French.", ScoreKeywordHits(aLower, s_apFrenchWords, std::size(s_apFrenchWords))},
+		{"pt", "Reply in Portuguese.", ScoreKeywordHits(aLower, s_apPortugueseWords, std::size(s_apPortugueseWords))},
+		{"pl", "Reply in Polish.", ScoreKeywordHits(aLower, s_apPolishWords, std::size(s_apPolishWords))},
+		{"tr", "Reply in Turkish.", ScoreKeywordHits(aLower, s_apTurkishWords, std::size(s_apTurkishWords))},
+	};
+
+	const SLanguageScore *pBest = nullptr;
+	const SLanguageScore *pSecond = nullptr;
+	for(const SLanguageScore &Score : aScores)
+	{
+		if(!pBest || Score.m_Score > pBest->m_Score)
+		{
+			pSecond = pBest;
+			pBest = &Score;
+		}
+		else if(!pSecond || Score.m_Score > pSecond->m_Score)
+		{
+			pSecond = &Score;
+		}
+	}
+
+	const int SecondScore = pSecond ? pSecond->m_Score : 0;
+	if(pBest && pBest->m_Score >= 2 && pBest->m_Score > SecondScore)
+	{
+		str_copy(pDetectedLanguage, pBest->m_pCode, DetectedLanguageSize);
+		str_copy(pLanguageHint, pBest->m_pHint, LanguageHintSize);
+	}
+	else
+	{
+		str_copy(pLanguageHint, "Reply in the same language as the latest message.", LanguageHintSize);
+	}
+}
+
+void CChat::BuildRuntimeSystemPrompt(SOllamaPendingRequest &Request) const
+{
+	std::string Prompt;
+	Prompt.reserve(OLLAMA_RUNTIME_PROMPT_SIZE);
+	Prompt.append("You are ");
+	Prompt.append(Request.m_aPersonaName);
+	Prompt.append(", a DDNet public chat persona. Keep replies short, natural, and suitable for in-game public chat. Write only the reply body with no persona prefix and no extra speaker prefix because the client formats those for you.");
+	Prompt.append(" Current mood: ");
+	Prompt.append(Request.m_aMoodLabel);
+	Prompt.push_back('.');
+	if(g_Config.m_ClOllamaMapContext && Request.m_aMapName[0])
+	{
+		Prompt.append(" Current map: ");
+		Prompt.append(Request.m_aMapName);
+		Prompt.push_back('.');
+	}
+	if(g_Config.m_ClOllamaLanguageHint && Request.m_aLanguageHint[0])
+	{
+		Prompt.push_back(' ');
+		Prompt.append(Request.m_aLanguageHint);
+	}
+	if(Request.m_TriggerKind == EOllamaTriggerKind::ADDRESSED && Request.m_aSpeaker[0])
+	{
+		Prompt.append(" This is a direct reply to ");
+		Prompt.append(Request.m_aSpeaker);
+		Prompt.append(". The visible chat line will already address that player once, so do not repeat their name inside the reply body.");
+	}
+	else
+	{
+		Prompt.append(" This is idle chatter. Join the ongoing public conversation naturally without inventing private context.");
+	}
+	if(Request.m_SpeakerMemory.m_aPlayerName[0])
+	{
+		Prompt.append(" Known session memory about ");
+		Prompt.append(Request.m_SpeakerMemory.m_aPlayerName);
+		Prompt.append(":");
+		if(Request.m_SpeakerMemory.m_aLastTopicExcerpt[0])
+		{
+			Prompt.append(" last topic=");
+			Prompt.append(Request.m_SpeakerMemory.m_aLastTopicExcerpt);
+			Prompt.push_back(';');
+		}
+		if(Request.m_SpeakerMemory.m_aLastPreferenceExcerpt[0])
+		{
+			Prompt.append(" last preference=");
+			Prompt.append(Request.m_SpeakerMemory.m_aLastPreferenceExcerpt);
+			Prompt.push_back(';');
+		}
+	}
+
+	str_copy(Request.m_aRuntimeSystemPrompt, Prompt.c_str(), sizeof(Request.m_aRuntimeSystemPrompt));
+}
+
+void CChat::EnqueueOllamaRequest(EOllamaTriggerKind TriggerKind, const char *pSpeakerName, const char *pMessage)
+{
+	if(!g_Config.m_ClOllamaEnable || !pMessage || !pMessage[0])
+	{
+		return;
+	}
+
+	if(TriggerKind == EOllamaTriggerKind::ADDRESSED && (!pSpeakerName || !pSpeakerName[0]))
 	{
 		return;
 	}
 
 	SOllamaPendingRequest Request;
-	str_copy(Request.m_aSender, pSenderName, sizeof(Request.m_aSender));
-	str_copy(Request.m_aMessage, pMessage, sizeof(Request.m_aMessage));
+	Request.m_RequestId = m_NextOllamaRequestId++;
+	Request.m_TriggerKind = TriggerKind;
+	if(pSpeakerName)
+	{
+		str_copy(Request.m_aSpeaker, pSpeakerName, sizeof(Request.m_aSpeaker));
+	}
+	str_copy(Request.m_aInputText, pMessage, sizeof(Request.m_aInputText));
+	str_copy(Request.m_aBaseSystemPrompt, g_Config.m_ClOllamaSystemPrompt, sizeof(Request.m_aBaseSystemPrompt));
+	GetOllamaPersonaName(Request.m_aPersonaName, sizeof(Request.m_aPersonaName));
+	str_copy(Request.m_aMapName, GameClient()->Map()->BaseName(), sizeof(Request.m_aMapName));
+
+	if(TriggerKind == EOllamaTriggerKind::ADDRESSED)
+	{
+		UpdateOllamaMood(pMessage);
+	}
+	Request.m_MoodScore = g_Config.m_ClOllamaMood ? m_OllamaMoodScore : 0;
+	str_copy(Request.m_aMoodLabel, GetOllamaMoodLabel(Request.m_MoodScore), sizeof(Request.m_aMoodLabel));
+
+	if(g_Config.m_ClOllamaPlayerMemory && Request.m_aSpeaker[0])
+	{
+		GetOllamaPlayerMemorySnapshot(Request.m_aSpeaker, Request.m_SpeakerMemory);
+	}
+
+	if(g_Config.m_ClOllamaLanguageHint)
+	{
+		DetectOllamaLanguageHint(Request.m_aInputText, Request.m_aLanguageHint, sizeof(Request.m_aLanguageHint), Request.m_aDetectedLanguage, sizeof(Request.m_aDetectedLanguage));
+	}
 
 	if(g_Config.m_ClOllamaContext)
 	{
@@ -785,6 +1403,8 @@ void CChat::EnqueueOllamaRequest(const char *pSenderName, const char *pMessage)
 		}
 	}
 
+	BuildRuntimeSystemPrompt(Request);
+
 	if((int)m_vOllamaPendingRequests.size() >= OLLAMA_PENDING_QUEUE_SIZE)
 	{
 		m_vOllamaPendingRequests.erase(m_vOllamaPendingRequests.begin());
@@ -794,6 +1414,231 @@ void CChat::EnqueueOllamaRequest(const char *pSenderName, const char *pMessage)
 	m_vOllamaPendingRequests.push_back(std::move(Request));
 	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "EnqueueOllamaRequest: request queued");
 	StartNextOllamaRequest();
+}
+
+bool CChat::IsIdleOllamaEligible(int64_t Now) const
+{
+	if(!g_Config.m_ClOllamaEnable || !g_Config.m_ClOllamaIdleChatter)
+	{
+		return false;
+	}
+
+	if(m_OllamaRequestPending || !m_vOllamaPendingRequests.empty())
+	{
+		return false;
+	}
+
+	if((int)m_vRecentPublicChats.size() < 3)
+	{
+		return false;
+	}
+
+	const int64_t SilenceThreshold = (int64_t)g_Config.m_ClOllamaIdleSeconds * time_freq();
+	if(m_LastOllamaReplyTime > 0 && Now - m_LastOllamaReplyTime < SilenceThreshold)
+	{
+		return false;
+	}
+	if(m_LastOllamaIdleChatTime > 0 && Now - m_LastOllamaIdleChatTime < SilenceThreshold)
+	{
+		return false;
+	}
+
+	const SOllamaRecentPublicChat &Latest = m_vRecentPublicChats.back();
+	if(Now - Latest.m_Time > (int64_t)OLLAMA_IDLE_RECENT_MESSAGE_SECONDS * time_freq())
+	{
+		return false;
+	}
+
+	int RecentMessages = 0;
+	std::vector<std::string> vDistinctPlayers;
+	const int64_t Cutoff = Now - (int64_t)OLLAMA_IDLE_ACTIVITY_WINDOW_SECONDS * time_freq();
+	for(const SOllamaRecentPublicChat &Entry : m_vRecentPublicChats)
+	{
+		if(Entry.m_Time < Cutoff)
+		{
+			continue;
+		}
+
+		++RecentMessages;
+		bool Seen = false;
+		for(const std::string &Player : vDistinctPlayers)
+		{
+			if(str_comp(Player.c_str(), Entry.m_aSender) == 0)
+			{
+				Seen = true;
+				break;
+			}
+		}
+		if(!Seen)
+		{
+			vDistinctPlayers.emplace_back(Entry.m_aSender);
+		}
+	}
+
+	return RecentMessages >= 3 && (int)vDistinctPlayers.size() >= 2;
+}
+
+void CChat::MaybeEnqueueIdleOllamaRequest(int64_t Now)
+{
+	PruneRecentPublicChatEvents(Now);
+	if(!IsIdleOllamaEligible(Now))
+	{
+		return;
+	}
+
+	const SOllamaRecentPublicChat &Latest = m_vRecentPublicChats.back();
+	if(!Latest.m_aText[0])
+	{
+		return;
+	}
+
+	m_LastOllamaIdleChatTime = Now;
+	EnqueueOllamaRequest(EOllamaTriggerKind::IDLE, "", Latest.m_aText);
+}
+
+void CChat::AppendOllamaLogEvent(const char *pEventType, const SOllamaPendingRequest &Request, const char *pOutgoingText, int HttpStatus, const char *pErrorReason) const
+{
+	if(g_Config.m_ClOllamaLogFile[0] == '\0')
+	{
+		return;
+	}
+
+	IOHANDLE File = Storage()->OpenFile(g_Config.m_ClOllamaLogFile, IOFLAG_APPEND, IStorage::TYPE_SAVE);
+	if(!File)
+	{
+		return;
+	}
+
+	char aTimestamp[20];
+	str_timestamp_format(aTimestamp, sizeof(aTimestamp), TimestampFormat::SPACE);
+
+	std::string Json = "{";
+	AppendJsonField(Json, "event", pEventType);
+	Json.push_back(',');
+	AppendJsonField(Json, "timestamp", aTimestamp);
+	Json.push_back(',');
+	AppendJsonIntField(Json, "request_id", Request.m_RequestId);
+	Json.push_back(',');
+	AppendJsonField(Json, "trigger", Request.m_TriggerKind == EOllamaTriggerKind::ADDRESSED ? "addressed" : "idle");
+	Json.push_back(',');
+	AppendJsonField(Json, "speaker", Request.m_aSpeaker);
+	Json.push_back(',');
+	AppendJsonField(Json, "input_text", Request.m_aInputText);
+	Json.push_back(',');
+	AppendJsonField(Json, "base_system_prompt", Request.m_aBaseSystemPrompt);
+	Json.push_back(',');
+	AppendJsonField(Json, "runtime_system_prompt", Request.m_aRuntimeSystemPrompt);
+	Json.push_back(',');
+	AppendJsonField(Json, "detected_language", Request.m_aDetectedLanguage);
+	Json.push_back(',');
+	AppendJsonField(Json, "language_hint", Request.m_aLanguageHint);
+	Json.push_back(',');
+	AppendJsonField(Json, "map", Request.m_aMapName);
+	Json.push_back(',');
+	AppendJsonField(Json, "persona", Request.m_aPersonaName);
+	Json.push_back(',');
+	AppendJsonIntField(Json, "mood_score", Request.m_MoodScore);
+	Json.push_back(',');
+	AppendJsonField(Json, "mood_label", Request.m_aMoodLabel);
+	Json.append(",\"context_lines\":[");
+	for(size_t i = 0; i < Request.m_vContext.size(); ++i)
+	{
+		if(i > 0)
+		{
+			Json.push_back(',');
+		}
+		Json.push_back('"');
+		AppendJsonEscaped(Json, Request.m_vContext[i].m_aText);
+		Json.push_back('"');
+	}
+	Json.append("],\"speaker_memory\":{");
+	AppendJsonField(Json, "player", Request.m_SpeakerMemory.m_aPlayerName);
+	Json.push_back(',');
+	AppendJsonField(Json, "topic", Request.m_SpeakerMemory.m_aLastTopicExcerpt);
+	Json.push_back(',');
+	AppendJsonField(Json, "preference", Request.m_SpeakerMemory.m_aLastPreferenceExcerpt);
+	Json.push_back(',');
+	AppendJsonIntField(Json, "last_seen_time", Request.m_SpeakerMemory.m_LastSeenTime);
+	Json.push_back('}');
+	Json.push_back(',');
+	AppendJsonField(Json, "outgoing_text", pOutgoingText ? pOutgoingText : "");
+	Json.push_back(',');
+	AppendJsonIntField(Json, "http_status", HttpStatus);
+	Json.push_back(',');
+	AppendJsonField(Json, "error_reason", pErrorReason ? pErrorReason : "");
+	Json.push_back('}');
+
+	io_write(File, Json.c_str(), (unsigned)Json.size());
+	io_write_newline(File);
+	io_close(File);
+}
+
+void CChat::BuildOllamaVisibleReply(const SOllamaPendingRequest &Request, const char *pResponseText, char *pBuffer, size_t BufferSize) const
+{
+	if(BufferSize == 0)
+	{
+		return;
+	}
+
+	pBuffer[0] = '\0';
+	if(!pResponseText || !pResponseText[0])
+	{
+		return;
+	}
+
+	const char *pBody = str_utf8_skip_whitespaces(pResponseText);
+	for(int i = 0; i < 4; ++i)
+	{
+		const char *pNext = SkipReplyPrefix(pBody, Request.m_aPersonaName);
+		if(pNext != pBody)
+		{
+			pBody = pNext;
+			continue;
+		}
+
+		if(Request.m_aSpeaker[0])
+		{
+			pNext = SkipReplyPrefix(pBody, Request.m_aSpeaker);
+			if(pNext != pBody)
+			{
+				pBody = pNext;
+				continue;
+			}
+		}
+
+		pNext = SkipReplyPrefix(pBody, "reply");
+		if(pNext != pBody)
+		{
+			pBody = pNext;
+			continue;
+		}
+		break;
+	}
+
+	char aBody[MAX_LINE_LENGTH];
+	NormalizeChatTextSingleLine(aBody, sizeof(aBody), pBody);
+	if(!aBody[0])
+	{
+		NormalizeChatTextSingleLine(aBody, sizeof(aBody), pResponseText);
+	}
+
+	if(!aBody[0])
+	{
+		return;
+	}
+
+	std::string Visible;
+	Visible.reserve(MAX_LINE_LENGTH);
+	Visible.append(Request.m_aPersonaName);
+	Visible.append(": ");
+	if(Request.m_TriggerKind == EOllamaTriggerKind::ADDRESSED && Request.m_aSpeaker[0])
+	{
+		Visible.append(Request.m_aSpeaker);
+		Visible.append(": ");
+	}
+	Visible.append(aBody);
+
+	str_copy(pBuffer, Visible.c_str(), BufferSize);
 }
 
 void CChat::StartNextOllamaRequest()
@@ -808,7 +1653,11 @@ void CChat::StartNextOllamaRequest()
 		m_ActiveOllamaRequest = std::move(m_vOllamaPendingRequests.front());
 		m_vOllamaPendingRequests.erase(m_vOllamaPendingRequests.begin());
 
-		if(!m_ActiveOllamaRequest.m_aSender[0] || !m_ActiveOllamaRequest.m_aMessage[0])
+		const bool InvalidAddressed = m_ActiveOllamaRequest.m_TriggerKind == EOllamaTriggerKind::ADDRESSED &&
+			(!m_ActiveOllamaRequest.m_aSpeaker[0] || !m_ActiveOllamaRequest.m_aInputText[0]);
+		const bool InvalidIdle = m_ActiveOllamaRequest.m_TriggerKind == EOllamaTriggerKind::IDLE &&
+			!m_ActiveOllamaRequest.m_aInputText[0];
+		if(InvalidAddressed || InvalidIdle)
 		{
 			m_ActiveOllamaRequest = SOllamaPendingRequest{};
 			continue;
@@ -824,7 +1673,9 @@ void CChat::StartNextOllamaRequest()
 		std::string JsonBody = "{\"model\":\"";
 		AppendJsonEscaped(JsonBody, g_Config.m_ClOllamaModel);
 		JsonBody.append("\",\"messages\":[");
-		AppendJsonMessage(JsonBody, "system", g_Config.m_ClOllamaSystemPrompt);
+		AppendJsonMessage(JsonBody, "system", m_ActiveOllamaRequest.m_aBaseSystemPrompt);
+		JsonBody.push_back(',');
+		AppendJsonMessage(JsonBody, "system", m_ActiveOllamaRequest.m_aRuntimeSystemPrompt);
 
 		for(const SOllamaHistoryEntry &Entry : m_ActiveOllamaRequest.m_vContext)
 		{
@@ -833,7 +1684,14 @@ void CChat::StartNextOllamaRequest()
 		}
 
 		char aPrompt[OLLAMA_MAX_HISTORY_TEXT];
-		str_format(aPrompt, sizeof(aPrompt), "%s: %s", m_ActiveOllamaRequest.m_aSender, m_ActiveOllamaRequest.m_aMessage);
+		if(m_ActiveOllamaRequest.m_TriggerKind == EOllamaTriggerKind::ADDRESSED)
+		{
+			str_format(aPrompt, sizeof(aPrompt), "%s: %s", m_ActiveOllamaRequest.m_aSpeaker, m_ActiveOllamaRequest.m_aInputText);
+		}
+		else
+		{
+			str_format(aPrompt, sizeof(aPrompt), "Recent public cue: %s", m_ActiveOllamaRequest.m_aInputText);
+		}
 		JsonBody.push_back(',');
 		AppendJsonMessage(JsonBody, "user", aPrompt);
 		JsonBody.append("],\"stream\":false}");
@@ -848,7 +1706,7 @@ void CChat::StartNextOllamaRequest()
 
 		m_pOllamaRequest = std::move(pRequest);
 		m_OllamaRequestPending = true;
-		str_copy(m_aOllamaPendingSender, m_ActiveOllamaRequest.m_aSender, sizeof(m_aOllamaPendingSender));
+		AppendOllamaLogEvent("request", m_ActiveOllamaRequest, "", 0, "");
 		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "StartNextOllamaRequest: request started");
 		return;
 	}
@@ -1134,28 +1992,35 @@ void CChat::AddLine(int ClientId, int Team, const char *pLine)
 	FChatMsgCheckAndPrint(CurrentLine);
 
 	const bool PublicPlayerChat = IsPublicPlayerChat(ClientId, Team);
+	const bool LocalPublicPlayerChat = PublicPlayerChat && IsLocalClient(ClientId);
+	const bool NonLocalPublicPlayerChat = PublicPlayerChat && !LocalPublicPlayerChat;
+	const bool IsPendingOllamaEcho = LocalPublicPlayerChat && ConsumePendingOllamaEcho(pLine);
+	const char *pStrippedPublicText = PublicPlayerChat ? StripLocalNamePrefix(pLine) : nullptr;
 	const bool ShouldQueueOllama = PublicPlayerChat &&
 		Highlighted &&
 		Client()->State() != IClient::STATE_DEMOPLAYBACK &&
-		!IsLocalClient(ClientId);
-	const char *pOllamaPrompt = ShouldQueueOllama ? StripLocalNamePrefix(pLine) : nullptr;
+		!LocalPublicPlayerChat;
+	const char *pOllamaPrompt = ShouldQueueOllama ? pStrippedPublicText : nullptr;
 
 	if(ShouldQueueOllama && pOllamaPrompt && pOllamaPrompt[0])
 	{
-		EnqueueOllamaRequest(CurrentLine.m_aName, pOllamaPrompt);
+		EnqueueOllamaRequest(EOllamaTriggerKind::ADDRESSED, CurrentLine.m_aName, pOllamaPrompt);
 	}
 
-	if(PublicPlayerChat)
+	int64_t Now = time();
+	if(PublicPlayerChat && !IsPendingOllamaEcho)
 	{
-		const bool IsPendingOllamaEcho = IsLocalClient(ClientId) && ConsumePendingOllamaEcho(pLine);
-		if(!IsPendingOllamaEcho)
+		AddPublicChatToOllamaHistory(CurrentLine.m_aName, pLine);
+		if(NonLocalPublicPlayerChat)
 		{
-			AddPublicChatToOllamaHistory(CurrentLine.m_aName, pLine);
+			const char *pMemoryText = pStrippedPublicText && pStrippedPublicText[0] ? pStrippedPublicText : pLine;
+			UpdateOllamaPlayerMemory(CurrentLine.m_aName, pMemoryText, Now);
+			AddRecentPublicChatEvent(CurrentLine.m_aName, pLine, Now);
+			PruneRecentPublicChatEvents(Now);
 		}
 	}
 
 	// play sound
-	int64_t Now = time();
 	if(ClientId == SERVER_MSG)
 	{
 		if(Now - m_aLastSoundPlayed[CHAT_SERVER] >= time_freq() * 3 / 10)
@@ -1189,6 +2054,8 @@ void CChat::AddLine(int ClientId, int Team, const char *pLine)
 				GameClient()->Editor()->UpdateMentions();
 			}
 			return;
+		}
+#if 0
 
 			// [ollama-debug] name was mentioned → try to fire AskOllama
 			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama",
@@ -1218,6 +2085,7 @@ void CChat::AddLine(int ClientId, int Team, const char *pLine)
 				AskOllama(CurrentLine.m_aName, pPrompt);
 			}
 		}
+#endif
 		else
 		{
 			return;
@@ -1246,12 +2114,15 @@ void CChat::AddLine(int ClientId, int Team, const char *pLine)
 }
 
 // ----- Ollama AI auto-reply -----
-void CChat::AskOllama(const char *pSenderName, const char *pMessage)
+void CChat::FinishOllamaRequest()
 {
-	(void)pSenderName;
-	(void)pMessage;
+	m_pOllamaRequest.reset();
+	m_OllamaRequestPending = false;
+	m_ActiveOllamaRequest = SOllamaPendingRequest{};
+	StartNextOllamaRequest();
 }
 
+#if 0
 void CChat::OnOllamaResponse()
 {
 	{
@@ -1428,6 +2299,79 @@ void CChat::OnOllamaResponse()
 
 	json_value_free(pJson);
 	m_pOllamaRequest.reset();
+}
+#endif
+
+void CChat::OnOllamaResponse()
+{
+	if(!m_pOllamaRequest)
+	{
+		return;
+	}
+
+	const EHttpState State = m_pOllamaRequest->State();
+	if(State == EHttpState::ERROR || State == EHttpState::ABORTED)
+	{
+		AppendOllamaLogEvent("error", m_ActiveOllamaRequest, "", m_pOllamaRequest->StatusCode(), State == EHttpState::ABORTED ? "aborted" : "http-error");
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: HTTP error or aborted");
+		FinishOllamaRequest();
+		return;
+	}
+
+	if(m_pOllamaRequest->StatusCode() != 200)
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "OnOllamaResponse: unexpected status %d", m_pOllamaRequest->StatusCode());
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", aBuf);
+		AppendOllamaLogEvent("error", m_ActiveOllamaRequest, "", m_pOllamaRequest->StatusCode(), "unexpected-status");
+		FinishOllamaRequest();
+		return;
+	}
+
+	json_value *pJson = m_pOllamaRequest->ResultJson();
+	if(!pJson)
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: JSON parse failed");
+		AppendOllamaLogEvent("error", m_ActiveOllamaRequest, "", m_pOllamaRequest->StatusCode(), "json-parse-failed");
+		FinishOllamaRequest();
+		return;
+	}
+
+	const char *pResponseText = FindMessageContent(pJson);
+	if(pResponseText && pResponseText[0])
+	{
+		char aVisibleReply[MAX_LINE_LENGTH];
+		BuildOllamaVisibleReply(m_ActiveOllamaRequest, pResponseText, aVisibleReply, sizeof(aVisibleReply));
+		if(aVisibleReply[0])
+		{
+			AddOllamaHistoryEntry(true, aVisibleReply);
+			if((int)m_vOllamaPendingEchoes.size() >= OLLAMA_PENDING_ECHO_LIMIT)
+			{
+				m_vOllamaPendingEchoes.erase(m_vOllamaPendingEchoes.begin());
+			}
+
+			SOllamaPendingEcho Echo;
+			str_copy(Echo.m_aText, aVisibleReply, sizeof(Echo.m_aText));
+			m_vOllamaPendingEchoes.push_back(Echo);
+
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: sending reply to chat");
+			SendChat(0, aVisibleReply);
+			m_LastOllamaReplyTime = time();
+			AppendOllamaLogEvent("response", m_ActiveOllamaRequest, aVisibleReply, m_pOllamaRequest->StatusCode(), "");
+		}
+		else
+		{
+			AppendOllamaLogEvent("error", m_ActiveOllamaRequest, "", m_pOllamaRequest->StatusCode(), "empty-visible-reply");
+		}
+	}
+	else
+	{
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "ollama", "OnOllamaResponse: no 'content' found in JSON");
+		AppendOllamaLogEvent("error", m_ActiveOllamaRequest, "", m_pOllamaRequest->StatusCode(), "missing-content");
+	}
+
+	json_value_free(pJson);
+	FinishOllamaRequest();
 }
 
 // --------------------------------
@@ -1682,6 +2626,10 @@ void CChat::OnRender()
 	else if(g_Config.m_ClOllamaEnable && !m_vOllamaPendingRequests.empty())
 	{
 		StartNextOllamaRequest();
+	}
+	else if(g_Config.m_ClOllamaEnable && Client()->State() != IClient::STATE_DEMOPLAYBACK)
+	{
+		MaybeEnqueueIdleOllamaRequest(time());
 	}
 	// send pending chat messages
 	if(m_PendingChatCounter > 0 && m_LastChatSend + time_freq() < time())

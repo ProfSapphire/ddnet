@@ -154,6 +154,18 @@ class CChat : public CComponent
 	static constexpr int OLLAMA_MAX_HISTORY_TEXT = 512;
 	static constexpr int OLLAMA_PENDING_QUEUE_SIZE = 3;
 	static constexpr int OLLAMA_PENDING_ECHO_LIMIT = 8;
+	static constexpr int OLLAMA_RUNTIME_PROMPT_SIZE = 2048;
+	static constexpr int OLLAMA_LANGUAGE_HINT_SIZE = 128;
+	static constexpr int OLLAMA_MAP_NAME_SIZE = 128;
+	static constexpr int OLLAMA_MOOD_LABEL_SIZE = 16;
+	static constexpr int OLLAMA_PLAYER_MEMORY_LIMIT = 16;
+	static constexpr int OLLAMA_RECENT_PUBLIC_CHAT_LIMIT = 24;
+
+	enum class EOllamaTriggerKind
+	{
+		ADDRESSED = 0,
+		IDLE,
+	};
 
 	struct SOllamaHistoryEntry
 	{
@@ -161,11 +173,37 @@ class CChat : public CComponent
 		char m_aText[OLLAMA_MAX_HISTORY_TEXT] = {0};
 	};
 
-	struct SOllamaPendingRequest
+	struct SOllamaPlayerMemory
+	{
+		char m_aPlayerName[64] = {0};
+		char m_aLastTopicExcerpt[65] = {0};
+		char m_aLastPreferenceExcerpt[49] = {0};
+		int64_t m_LastSeenTime = 0;
+	};
+
+	struct SOllamaRecentPublicChat
 	{
 		char m_aSender[64] = {0};
-		char m_aMessage[MAX_LINE_LENGTH] = {0};
+		char m_aText[MAX_LINE_LENGTH] = {0};
+		int64_t m_Time = 0;
+	};
+
+	struct SOllamaPendingRequest
+	{
+		int64_t m_RequestId = 0;
+		EOllamaTriggerKind m_TriggerKind = EOllamaTriggerKind::ADDRESSED;
+		char m_aSpeaker[64] = {0};
+		char m_aInputText[MAX_LINE_LENGTH] = {0};
 		std::vector<SOllamaHistoryEntry> m_vContext;
+		char m_aDetectedLanguage[32] = {0};
+		char m_aLanguageHint[OLLAMA_LANGUAGE_HINT_SIZE] = {0};
+		char m_aMapName[OLLAMA_MAP_NAME_SIZE] = {0};
+		char m_aPersonaName[64] = {0};
+		int m_MoodScore = 0;
+		char m_aMoodLabel[OLLAMA_MOOD_LABEL_SIZE] = {0};
+		SOllamaPlayerMemory m_SpeakerMemory;
+		char m_aBaseSystemPrompt[512] = {0};
+		char m_aRuntimeSystemPrompt[OLLAMA_RUNTIME_PROMPT_SIZE] = {0};
 	};
 
 	struct SOllamaPendingEcho
@@ -175,24 +213,42 @@ class CChat : public CComponent
 
 	std::shared_ptr<CHttpRequest> m_pOllamaRequest;
 	bool m_OllamaRequestPending = false;
-	char m_aOllamaPendingSender[64] = {0};
 	SOllamaPendingRequest m_ActiveOllamaRequest;
 	std::vector<SOllamaHistoryEntry> m_vOllamaHistory;
 	std::vector<SOllamaPendingRequest> m_vOllamaPendingRequests;
 	std::vector<SOllamaPendingEcho> m_vOllamaPendingEchoes;
+	std::vector<SOllamaPlayerMemory> m_vOllamaPlayerMemories;
+	std::vector<SOllamaRecentPublicChat> m_vRecentPublicChats;
+	int64_t m_NextOllamaRequestId = 1;
+	int m_OllamaMoodScore = 0;
+	int64_t m_LastOllamaReplyTime = 0;
+	int64_t m_LastOllamaIdleChatTime = 0;
 
 	void CancelOllamaWork();
 	void ResetOllamaState();
 	void AddOllamaHistoryEntry(bool Assistant, const char *pText);
 	void AddPublicChatToOllamaHistory(const char *pSenderName, const char *pMessage);
-	void EnqueueOllamaRequest(const char *pSenderName, const char *pMessage);
+	void EnqueueOllamaRequest(EOllamaTriggerKind TriggerKind, const char *pSpeakerName, const char *pMessage);
 	void StartNextOllamaRequest();
 	bool ConsumePendingOllamaEcho(const char *pText);
 	bool IsPublicPlayerChat(int ClientId, int Team) const;
 	bool IsLocalClient(int ClientId) const;
 	const char *StripLocalNamePrefix(const char *pMessage) const;
-	void AskOllama(const char *pSenderName, const char *pMessage);
 	void OnOllamaResponse();
+	void FinishOllamaRequest();
+	void BuildRuntimeSystemPrompt(SOllamaPendingRequest &Request) const;
+	void DetectOllamaLanguageHint(const char *pMessage, char *pLanguageHint, size_t LanguageHintSize, char *pDetectedLanguage, size_t DetectedLanguageSize) const;
+	void UpdateOllamaMood(const char *pMessage);
+	void UpdateOllamaPlayerMemory(const char *pSpeakerName, const char *pMessage, int64_t Now);
+	bool GetOllamaPlayerMemorySnapshot(const char *pSpeakerName, SOllamaPlayerMemory &Memory) const;
+	void AddRecentPublicChatEvent(const char *pSpeakerName, const char *pMessage, int64_t Now);
+	void PruneRecentPublicChatEvents(int64_t Now);
+	bool IsIdleOllamaEligible(int64_t Now) const;
+	void MaybeEnqueueIdleOllamaRequest(int64_t Now);
+	void AppendOllamaLogEvent(const char *pEventType, const SOllamaPendingRequest &Request, const char *pOutgoingText, int HttpStatus, const char *pErrorReason) const;
+	void GetOllamaPersonaName(char *pBuffer, size_t BufferSize) const;
+	void BuildOllamaVisibleReply(const SOllamaPendingRequest &Request, const char *pResponseText, char *pBuffer, size_t BufferSize) const;
+	const char *GetOllamaMoodLabel(int MoodScore) const;
 	// --------------------------------
 
 	static void ConSay(IConsole::IResult *pResult, void *pUserData);
