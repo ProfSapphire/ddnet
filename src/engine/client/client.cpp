@@ -1620,6 +1620,9 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket, int Conn, bool Dummy)
 				pMapUrl = "";
 			}
 
+			if(pMapUrl[0] && !str_startswith(pMapUrl, "https://"))
+				pMapUrl = "";
+
 			m_MapDetails = std::make_optional<CMapDetails>();
 			CMapDetails &MapDetails = m_MapDetails.value();
 			str_copy(MapDetails.m_aName, pMap);
