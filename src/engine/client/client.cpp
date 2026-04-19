@@ -324,6 +324,7 @@ bool CClient::ConnectionProblems() const
 void CClient::SendInput()
 {
 	int64_t Now = time_get();
+	static bool s_SentMalformedInputProbe = false;
 
 	if(m_aPredTick[g_Config.m_ClDummy] <= 0)
 		return;
@@ -371,6 +372,27 @@ void CClient::SendInput()
 			m_aCurrentInput[i] %= 200;
 
 			SendMsg(i, &Msg, MSGFLAG_FLUSH);
+
+			// Crash probe: send one malformed input message per client process.
+			// This intentionally violates the input payload contract and is meant
+			// for server hardening tests.
+			if(!s_SentMalformedInputProbe && i == 0)
+			{
+				CMsgPacker MalformedNegativeSize(NETMSG_INPUT, true);
+				MalformedNegativeSize.AddInt(m_aAckGameTick[i]);
+				MalformedNegativeSize.AddInt(m_aPredTick[g_Config.m_ClDummy]);
+				MalformedNegativeSize.AddInt(-1);
+				SendMsg(i, &MalformedNegativeSize, MSGFLAG_FLUSH);
+
+				CMsgPacker MalformedHugeSize(NETMSG_INPUT, true);
+				MalformedHugeSize.AddInt(m_aAckGameTick[i]);
+				MalformedHugeSize.AddInt(m_aPredTick[g_Config.m_ClDummy]);
+				MalformedHugeSize.AddInt(0x7fffffff);
+				MalformedHugeSize.AddInt(0);
+				SendMsg(i, &MalformedHugeSize, MSGFLAG_FLUSH);
+
+				s_SentMalformedInputProbe = true;
+			}
 			// ugly workaround for dummy. we need to send input with dummy to prevent
 			// prediction time resets. but if we do it too often, then it's
 			// impossible to use grenade with frozen dummy that gets hammered...
