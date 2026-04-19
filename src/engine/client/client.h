@@ -433,6 +433,7 @@ public:
 	static void Con_Minimize(IConsole::IResult *pResult, void *pUserData);
 	static void Con_Ping(IConsole::IResult *pResult, void *pUserData);
 	static void ConNetReset(IConsole::IResult *pResult, void *pUserData);
+	static void Con_DbgSendTruncatedChunkPacket(IConsole::IResult *pResult, void *pUserData);
 	static void Con_Screenshot(IConsole::IResult *pResult, void *pUserData);
 
 #if defined(CONF_VIDEORECORDER)

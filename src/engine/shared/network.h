@@ -601,6 +601,7 @@ public:
 	// communication
 	int Recv(CNetChunk *pChunk, SECURITY_TOKEN *pResponseToken, bool Sixup);
 	int Send(CNetChunk *pChunk);
+	bool SendChunkHeaderTruncationProbe(char *pError, int ErrorSize);
 
 	// pumping
 	void Update();

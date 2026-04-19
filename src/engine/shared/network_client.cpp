@@ -5,9 +5,11 @@
 #include <base/dbg.h>
 #include <base/mem.h>
 #include <base/net.h>
+#include <base/str.h>
 #include <base/time.h>
 #include <base/types.h>
 
+#include <engine/shared/protocolglue.h>
 #include <engine/shared/protocol7.h>
 
 bool CNetClient::Open(NETADDR BindAddr)
@@ -180,6 +182,84 @@ int CNetClient::Send(CNetChunk *pChunk)
 			m_Connection.Flush();
 	}
 	return 0;
+}
+
+bool CNetClient::SendChunkHeaderTruncationProbe(char *pError, int ErrorSize)
+{
+	if(ErrorSize > 0)
+	{
+		pError[0] = '\0';
+	}
+
+	if(m_Connection.State() != CNetConnection::EState::ONLINE)
+	{
+		str_copy(pError, "Not connected to a server.", ErrorSize);
+		return false;
+	}
+
+	const bool HasInlineToken = !m_Connection.m_Sixup && m_Connection.SecurityToken() != NET_SECURITY_TOKEN_UNSUPPORTED;
+	if((m_Connection.m_Sixup || HasInlineToken) && m_Connection.SecurityToken() == NET_SECURITY_TOKEN_UNKNOWN)
+	{
+		str_copy(pError, "Connection security token is still unknown.", ErrorSize);
+		return false;
+	}
+
+	unsigned char aPacket[NET_MAX_PACKETSIZE];
+	mem_zero(aPacket, sizeof(aPacket));
+
+	const int PacketHeaderSize = m_Connection.m_Sixup ? NET_PACKETHEADERSIZE + (int)sizeof(SECURITY_TOKEN) : NET_PACKETHEADERSIZE;
+	const int LogicalDataSize = m_Connection.m_Sixup ?
+		NET_MAX_PACKETSIZE - PacketHeaderSize :
+		NET_MAX_PAYLOAD - (HasInlineToken ? (int)sizeof(SECURITY_TOKEN) : 0);
+	const int HeaderSplit = m_Connection.m_Sixup ? 6 : 4;
+	const int ChunkHeaderSize = 2;
+
+	// Serialize two valid chunks that exactly consume the available chunk payload,
+	// but advertise three chunks in the packet header. The third header is missing,
+	// so the receiver will try to unpack a header at the end of the logical packet.
+	const int FirstChunkSize = NET_MAX_CHUNK_SIZE;
+	const int SecondChunkSize = LogicalDataSize - (ChunkHeaderSize + FirstChunkSize) - ChunkHeaderSize;
+	if(SecondChunkSize < 0 || SecondChunkSize > NET_MAX_CHUNK_SIZE)
+	{
+		str_copy(pError, "Could not build the truncation probe packet.", ErrorSize);
+		return false;
+	}
+
+	unsigned char *pWrite = aPacket + PacketHeaderSize;
+	CNetChunkHeader FirstHeader;
+	FirstHeader.m_Flags = 0;
+	FirstHeader.m_Size = FirstChunkSize;
+	FirstHeader.m_Sequence = 0;
+	pWrite = FirstHeader.Pack(pWrite, HeaderSplit);
+	pWrite += FirstChunkSize;
+
+	CNetChunkHeader SecondHeader;
+	SecondHeader.m_Flags = 0;
+	SecondHeader.m_Size = SecondChunkSize;
+	SecondHeader.m_Sequence = 0;
+	pWrite = SecondHeader.Pack(pWrite, HeaderSplit);
+	pWrite += SecondChunkSize;
+
+	int Flags = 0;
+	if(m_Connection.m_Sixup)
+	{
+		Flags = PacketFlags_SixToSeven(Flags);
+		WriteSecurityToken(aPacket + NET_PACKETHEADERSIZE, m_Connection.SecurityToken());
+	}
+
+	const int Ack = m_Connection.AckSequence();
+	aPacket[0] = ((Flags << 2) & 0xfc) | ((Ack >> 8) & 0x3);
+	aPacket[1] = Ack & 0xff;
+	aPacket[2] = 3;
+
+	if(HasInlineToken)
+	{
+		WriteSecurityToken(aPacket + PacketHeaderSize + LogicalDataSize, m_Connection.SecurityToken());
+	}
+
+	const int PacketSize = PacketHeaderSize + LogicalDataSize + (HasInlineToken ? (int)sizeof(SECURITY_TOKEN) : 0);
+	net_udp_send(m_Socket, const_cast<NETADDR *>(m_Connection.PeerAddress()), aPacket, PacketSize);
+	return true;
 }
 
 int CNetClient::State()

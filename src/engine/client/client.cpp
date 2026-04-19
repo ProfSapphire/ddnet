@@ -3626,6 +3626,28 @@ void CClient::ConNetReset(IConsole::IResult *pResult, void *pUserData)
 	pSelf->ResetSocket();
 }
 
+void CClient::Con_DbgSendTruncatedChunkPacket(IConsole::IResult *pResult, void *pUserData)
+{
+	CClient *pSelf = (CClient *)pUserData;
+
+	char aError[128];
+	if(!pSelf->m_aNetClient[CONN_MAIN].SendChunkHeaderTruncationProbe(aError, sizeof(aError)))
+	{
+		pSelf->m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "client", aError, CLIENT_NETWORK_PRINT_ERROR_COLOR);
+		return;
+	}
+
+	pSelf->m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "client",
+		"Sent a malformed raw packet with a missing final chunk header to the current server.",
+		CLIENT_NETWORK_PRINT_COLOR);
+	if(!pSelf->IsSixup())
+	{
+		pSelf->m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "client",
+			"On tokenized 0.6 connections this often only becomes an observable crash under ASan or similar instrumentation.",
+			CLIENT_NETWORK_PRINT_COLOR);
+	}
+}
+
 void CClient::AutoScreenshot_Start()
 {
 	if(g_Config.m_ClAutoScreenshot)
@@ -4536,6 +4558,7 @@ void CClient::RegisterCommands()
 	m_pConsole->Register("ping", "", CFGFLAG_CLIENT, Con_Ping, this, "Ping the current server");
 	m_pConsole->Register("screenshot", "", CFGFLAG_CLIENT | CFGFLAG_STORE, Con_Screenshot, this, "Take a screenshot");
 	m_pConsole->Register("net_reset", "", CFGFLAG_CLIENT, ConNetReset, this, "Rebinds the client's listening address and port");
+	m_pConsole->Register("dbg_send_truncated_chunk_packet", "", CFGFLAG_CLIENT, Con_DbgSendTruncatedChunkPacket, this, "Send a malformed raw packet with a missing chunk header to the current server (testing only)");
 
 #if defined(CONF_VIDEORECORDER)
 	m_pConsole->Register("start_video", "?r[file]", CFGFLAG_CLIENT, Con_StartVideo, this, "Start recording a video");
